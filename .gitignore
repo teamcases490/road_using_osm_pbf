@@ -1,0 +1,25 @@
+# Large Input Data (Water Raster)
+data/input/*.tif
+data/input/*.tiff
+
+# Temporary Cache 
+data/cache/
+
+# Generated Outputs
+data/output/
+
+# Checkpoint Files
+*.pkl
+
+# Python Environments & Cache
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.env
+
+# MacOS & Windows Junk
+.DS_Store
+Thumbs.db
