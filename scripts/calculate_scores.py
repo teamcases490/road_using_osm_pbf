@@ -20,8 +20,8 @@ INPUT_FILE = "data/output/preprocessed_features.csv"
 OUTPUT_FILE = "data/output/road_scores.csv"
 
 # Component weights (should sum to 1.0)
-WEIGHT_U = 0.40  # Urbanicity
-WEIGHT_H = 0.40  # Hierarchy
+WEIGHT_U = 0.45  # Urbanicity (Increased from 0.40)
+WEIGHT_H = 0.35  # Hierarchy (Reduced from 0.40)
 WEIGHT_C = 0.10  # Capacity
 WEIGHT_Q = 0.10  # Quality 
 
@@ -39,7 +39,7 @@ WEIGHT_NODE_DEGREE     = 0.20
 # Any value above these thresholds gets a score of 1.0
 # Calibrated from dataset of 1010 Indian locations
 ABSOLUTE_THRESHOLDS = {
-    'Density': 20.0,              # km/km² (100m grid = 20) - Physical geometry
+    'Density': 12.0,              # km/km² (REFINED: >12 is dense urban)
     'IntersectionDensity': 80.0,  # count/km² (approx 8-9 per 100m block)
     'AvgNodeDegree': 3.5,         # Max connectivity
     'lane_km_per_km2': 100.0,     # lane-km/km² (95th percentile from dataset)
@@ -64,11 +64,10 @@ CATEGORIES = {
 }
 
 # Gate Thresholds
-SCALE_GATE_THRESHOLD = 0.5      # Minimum regional score to avoid capping
-SCALE_GATE_CAP = 0.5
-HIERARCHY_GATE_THRESHOLD = 0.05 # Min % of major roads
-HIERARCHY_GATE_PENALTY = 0.5
-SPRAWL_PENALTY_EXPONENT = 0.5   # Penalty for isolated density
+# Scale Gate removed — was incorrectly capping urban residential areas
+HIERARCHY_GATE_THRESHOLD = 0.05  # Min share of major roads to avoid penalty
+HIERARCHY_GATE_PENALTY   = 0.5
+SPRAWL_PENALTY_EXPONENT  = 0.3   # Reduced from 0.5 to help coastal/hilly areas
 
 # ============================================================================
 # HELPER FUNCTIONS
@@ -105,35 +104,23 @@ def calculate_urbanicity(df, radius):
     return U.clip(0, 1), dens  # Return density separately for other calculations
 
 def calculate_hierarchy(df, radius, density_score):
-    """Calculate Hierarchy using Subtraction Method 
+    """Calculate Hierarchy using Weighted Sum of Road Classes.
     
-    Returns a value from -1 to +1:
-    - Positive: Commercial/Arterial (high major roads)
-    - Negative: Residential (high local access)
-    - Near 0: Mixed use
-    
-    This prevents adding Major + Local which makes different types look similar.
+    Weights road classes by importance. Posh residential is GOOD (0.5).
+    Ensures zero density = zero hierarchy.
     """
     suffix = f"_{radius}"
-    
-    # Major Road Connectivity (0-1)
-    major = df.get(f"Major_Road_Connectivity{suffix}", 0).clip(0, 1)
-    
-    # Local Access Intensity (0-1)
-    local = df.get(f"Local_Access_Intensity{suffix}", 0).clip(0, 1)
-    
-    # Subtraction Method: Major - Local
-    # Result ranges from -1 (pure residential) to +1 (pure arterial)
-    H_raw = major - local
-    
-    # Density Penalty: If area is empty, hierarchy is meaningless
-    H = H_raw * (density_score * 2).clip(0, 1)
-    
-    # Normalize to 0-1 for consistency with other components
-    # Map [-1, 1] → [0, 1]
-    H_normalized = (H + 1.0) / 2.0
-    
-    return H_normalized.clip(0, 1)
+    weights = {
+        'motorway': 1.0, 'trunk': 1.0, 'primary': 0.8,
+        'secondary': 0.6, 'tertiary': 0.4, 'residential': 0.5,
+        'living_street': 0.5, 'unclassified': 0.2, 'service': 0.1
+    }
+    H = pd.Series(0.0, index=df.index)
+    for cat, weight in weights.items():
+        col = f"share_{cat}{suffix}"
+        if col in df.columns:
+            H += df[col] * weight
+    return (H * (density_score * 2).clip(0, 1)).clip(0, 1)
 
 def calculate_capacity(df, radius):
     """Calculate Capacity using Network Capacity (REFINED)
@@ -230,13 +217,13 @@ def main():
     parser.add_argument("--output", default=OUTPUT_FILE)
     args = parser.parse_args()
     
-    print(f"\n🚀 STARTING ROAD SCORING (Absolute Thresholds)")
+    print(f"\n[STARTING ROAD SCORING (Absolute Thresholds)]")
     print(f"   Input: {args.input}")
     
     try:
         df = pd.read_csv(args.input)
     except Exception as e:
-        print(f"❌ Error reading input: {e}")
+        print(f"Error reading input: {e}")
         return
 
     # Pre-calc 2000m context
@@ -250,7 +237,7 @@ def main():
     results = df.copy()
     
     for r in [500, 1000, 2000]:
-        print(f"   ► Processing {r}m radius...")
+        print(f"   - Processing {r}m radius...")
         # Components
         U, dens_score = calculate_urbanicity(df, r)
         H = calculate_hierarchy(df, r, dens_score)
@@ -271,41 +258,49 @@ def main():
         results[f"RS_{r}"] = RS
         
     # Multi-scale Fusion
-    print(f"   ► Fusing scales (Weighted: {WEIGHT_500}/{WEIGHT_1000}/{WEIGHT_2000})...")
-    RoadScore = (WEIGHT_500 * results['RS_500'] + 
-                 WEIGHT_1000 * results['RS_1000'] + 
+    print(f"   - Fusing scales (Weighted: {WEIGHT_500}/{WEIGHT_1000}/{WEIGHT_2000})...")
+    RoadScore = (WEIGHT_500 * results['RS_500'] +
+                 WEIGHT_1000 * results['RS_1000'] +
                  WEIGHT_2000 * results['RS_2000'])
+
+    # Sprawl Penalty: areas with very low 2km density are likely rural/isolated
+    dens_2000 = normalize_absolute(df['Density_2000'], ABSOLUTE_THRESHOLDS['Density'])
+    # Gentler sprawl: exponent 0.2 + floor of 0.8 to prevent coastal crushing
+    sprawl_factor = (dens_2000 ** 0.2).clip(lower=0.8)
     
-    # Scale Gate (Regional Cap)
-    mask_cap = results['RS_2000'] < SCALE_GATE_THRESHOLD
-    RoadScore[mask_cap] = RoadScore[mask_cap].clip(upper=SCALE_GATE_CAP)
+    # Store intermediate values for debugging
+    results['RS_Fusion'] = RoadScore.copy()
+    results['Sprawl_Factor'] = sprawl_factor
     
-    # Sprawl Penalty
-    dens_2000 = normalize_absolute(df.get('Density_2000', 0), ABSOLUTE_THRESHOLDS['Density'])
-    sprawl_factor = dens_2000 ** SPRAWL_PENALTY_EXPONENT
+    # Apply sprawl penalty
     RoadScore = RoadScore * sprawl_factor
-    
+
+    # Final Zero-Mask: No roads within 500m → score must be 0
+    no_roads_mask = df['Density_500'] == 0
+    RoadScore.loc[no_roads_mask] = 0.0
+
     results['RoadScore'] = RoadScore
     
     # ========================================================================
-    # QUALITY GATEKEEPER (NEW - Prevents slums from scoring as Metro)
+    # QUALITY GATEKEEPER (REFINED)
     # ========================================================================
-    print(f"   ► Applying Quality gatekeeper...")
+    print(f"   - Applying Quality gatekeeper...")
     
-    # Check Congestion Risk at 500m (most sensitive to local conditions)
-    congestion_risk = df.get('Congestion_Risk_500', 0)
+    # Only flag if it's TRULY informal (High informal proxy + Low Quality)
+    informal_proxy_500 = df.get('Informal_Proxy_500', 0)
+    major_roads_500 = df.get('Major_Road_Connectivity_500', 0)
     quality_500 = results.get('Q_500', 1.0)
+    congestion_risk = df.get('Congestion_Risk_500', 0)
     
-    # Flag locations with high congestion risk OR low quality
-    informal_flag = (congestion_risk > 2.0) | (quality_500 < 0.3)
+    # Flag: Very high informal content OR (High density AND Low connectivity AND Low quality)
+    informal_flag = (informal_proxy_500 > 0.6) | ((congestion_risk > 12.0) & (quality_500 < 0.25) & (major_roads_500 < 0.1))
     
     # Downgrade RoadScore for flagged locations
-    # Prevents dense slums from being classified as "Metro"
     results.loc[informal_flag, 'RoadScore'] = results.loc[informal_flag, 'RoadScore'] * 0.75
     
     flagged_count = informal_flag.sum()
     if flagged_count > 0:
-        print(f"   ⚠ Quality gatekeeper flagged {flagged_count} locations (high congestion/low quality)")
+        print(f"   ! Quality gatekeeper flagged {flagged_count} locations as potentially informal")
     
     # Categorize
     def get_cat(score, is_flagged):
@@ -318,40 +313,22 @@ def main():
             if low <= score < high: return cat
         return 'Metro'
     
-    results['Category'] = results.apply(
-        lambda row: get_cat(row['RoadScore'], informal_flag[row.name]), 
-        axis=1
-    )
+    results['Category'] = [get_cat(s, f) for s, f in zip(results['RoadScore'], informal_flag)]
     
     # Select only essential columns for output
-    output_cols = []
+    output_cols = ['address', 'lat', 'lon', 'RoadScore', 'Category', 'RS_Fusion', 'Sprawl_Factor']
     
-    # 1. Keep input columns (address, lat, lon, etc.)
-    input_cols = ['address', 'lat', 'lon']
-    for col in input_cols:
-        if col in results.columns:
-            output_cols.append(col)
-    
-    # 2. Component scores for each radius
+    # Add components for transparency
     for r in [500, 1000, 2000]:
         for component in ['U', 'H', 'C', 'Q']:
             col = f'{component}_{r}'
             if col in results.columns:
                 output_cols.append(col)
     
-    # 3. Radius scores (optional - can be removed if not needed)
-    for r in [500, 1000, 2000]:
-        col = f'RS_{r}'
-        if col in results.columns:
-            output_cols.append(col)
-    
-    # 4. Final scores
-    output_cols.extend(['RoadScore', 'Category'])
-    
     # Save only selected columns
     results[output_cols].to_csv(args.output, index=False)
     
-    print(f"✅ DONE! Saved to {args.output}")
+    print(f"DONE! Saved to {args.output}")
     print("\n   Sample Results:")
     # Display Quality scores if available
     display_cols = ['address', 'RoadScore', 'Category']

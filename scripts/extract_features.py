@@ -28,18 +28,50 @@ except ImportError:
     logging.warning("Rasterio not found. Water correction will be disabled.")
 
 # ---------------------------------------------------------
+# Add parent directory to sys.path to import config
+sys.path.append(str(Path(__file__).parent.parent))
+import config
+
+# ---------------------------------------------------------
 warnings.filterwarnings("ignore", category=UserWarning)
 ox.settings.log_console = False
 ox.settings.use_cache = True
 _SCRIPT_DIR = Path(__file__).parent.absolute()
 _DATA_DIR   = _SCRIPT_DIR.parent / "data"
 ox.settings.cache_folder = str(_DATA_DIR / "cache")
-ox.settings.overpass_settings = '[out:json][timeout:90][date:"2025-03-01T00:00:00Z"]'
+
+# Lock every worker process to local Docker — called at module import AND inside each worker
+def _configure_osmnx():
+    """Lock OSMnx 2.x to the local Docker Overpass instance."""
+    # OSMnx 2.x source: url = settings.overpass_url.rstrip("/") + "/interpreter"
+    # So overpass_url must be the BASE (e.g. http://127.0.0.1:12345/api), NOT the full path.
+    base_url = config.OSM_OVERPASS_URL.rstrip("/")
+    if base_url.endswith("/interpreter"):
+        base_url = base_url[: -len("/interpreter")]
+
+    ox.settings.overpass_url = base_url
+
+    # CRITICAL: Local Docker reports "Rate limit: 0" which OSMnx interprets as
+    # "0 slots available" and polls /api/status forever. Disable rate limiting.
+    try:
+        ox.settings.overpass_rate_limit = False
+    except AttributeError:
+        pass
+
+    try:
+        ox.settings.timeout = config.OVERPASS_TIMEOUT
+    except AttributeError:
+        pass
+
+    if not hasattr(_configure_osmnx, "_logged"):
+        logging.info(f"Overpass → {base_url}/interpreter  [rate_limit=off]")
+        _configure_osmnx._logged = True
+
+_configure_osmnx()
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
 WATER_RASTER = _DATA_DIR / "input" / "merged_gsw_compressed.tif"
-CHECKPOINT_FILE = "processing_checkpoint.pkl"
-CHECKPOINT_INTERVAL = 10
+# Checkpoint logic refactored to use CSV instead of .pkl below
 
 # ---------------------------------------------------------
 # IRC-BASED LANE DEFAULTS
@@ -62,9 +94,15 @@ IRC_LANE_WIDTH = {
 # Helpers
 # ---------------------------------------------------------
 def get_utm_crs(lat, lon):
-    zone = int((lon + 180) / 6) + 1
-    epsg = 32600 + zone if lat >= 0 else 32700 + zone
-    return f"EPSG:{epsg}"
+    try:
+        # Basic bounds checking
+        if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
+            return "EPSG:3857" # Fallback to Web Mercator if invalid
+        zone = int((lon + 180) / 6) + 1
+        epsg = 32600 + zone if lat >= 0 else 32700 + zone
+        return f"EPSG:{epsg}"
+    except Exception:
+        return "EPSG:3857"
 
 
 def normalize_highway(val):
@@ -232,19 +270,35 @@ def compute_features_from_gdfs(nodes_utm, edges_utm, buffer_utm, radius, area_km
         features[f"share_{parent}_{radius}"] = share_val
     return features
 def process_point(lat, lon, address=None, radii=[500, 1000, 2000], verbose=False):
-    results = {"address": address, "lat": lat, "lon": lon, "extraction_error": ""}
+    # Ensure local config in worker process
+    _configure_osmnx()
+    results = {
+        "address": address, 
+        "lat": lat, 
+        "lon": lon, 
+        "status": "Success",
+        "extraction_error": ""
+    }
     if pd.isna(lat) or pd.isna(lon):
         results["extraction_error"] = "Invalid coordinates: NaN"
         return results
-    utm_crs = get_utm_crs(lat, lon)
-    max_radius = max(radii)
-    base_wgs = gpd.GeoSeries([Point(lon, lat)], crs="EPSG:4326").iloc[0]
-    base_utm = gpd.GeoSeries([base_wgs], crs="EPSG:4326").to_crs(utm_crs).iloc[0]
-    buffers_utm = {r: base_utm.buffer(r) for r in radii}
-    buffers_wgs = {
-        r: gpd.GeoSeries([buffers_utm[r]], crs=utm_crs).to_crs("EPSG:4326").iloc[0]
-        for r in radii
-    }
+    try:
+        utm_crs = get_utm_crs(lat, lon)
+        max_radius = max(radii)
+        base_wgs = gpd.GeoSeries([Point(lon, lat)], crs="EPSG:4326").iloc[0]
+        base_utm = gpd.GeoSeries([base_wgs], crs="EPSG:4326").to_crs(utm_crs).iloc[0]
+        buffers_utm = {r: base_utm.buffer(r) for r in radii}
+        buffers_wgs = {
+            r: gpd.GeoSeries([buffers_utm[r]], crs=utm_crs).to_crs("EPSG:4326").iloc[0]
+            for r in radii
+        }
+    except Exception as e:
+        results["extraction_error"] = f"Geometry initialization failed: {e}"
+        results["status"] = "Error"
+        # Return empty features for all radii
+        for r in radii:
+            results.update(compute_features_from_gdfs(gpd.GeoDataFrame(), gpd.GeoDataFrame(), None, r, 0.001, None))
+        return results
     try:
         if verbose: logging.info(f"Fetching road graph at max radius {max_radius}m (single API call)...")
         G_max = ox.graph_from_polygon(buffers_wgs[max_radius], network_type="drive", simplify=False, retain_all=True)
@@ -294,180 +348,178 @@ def process_point(lat, lon, address=None, radii=[500, 1000, 2000], verbose=False
                 results.update(compute_features_from_gdfs(gpd.GeoDataFrame(), gpd.GeoDataFrame(), buffer_utm, r, area_km2, base_utm))
     return results
 # ---
-def save_checkpoint(results, index):
-    with open(CHECKPOINT_FILE, 'wb') as f:
-        pickle.dump({'results': results, 'last_index': index}, f)
-def load_checkpoint():
-    if os.path.exists(CHECKPOINT_FILE):
-        try:
-            with open(CHECKPOINT_FILE, 'rb') as f: data = pickle.load(f)
-            return data['results'], data['last_index']
-        except Exception as e: logging.warning(f"Could not load checkpoint: {e}")
-    return [], -1
-# ---------------------------------------------------------
-# CSV Input Reader
-# ---------------------------------------------------------
+def _load_processed_set(csv_path: Path) -> set:
+    """Return set of (lat, lon) already in the output CSV."""
+    if not csv_path.exists(): return set()
+    try:
+        # We use lat/lon as the unique key for resume
+        df = pd.read_csv(csv_path, usecols=["lat", "lon"])
+        return {(round(r.lat, 6), round(r.lon, 6)) for r in df.itertuples()}
+    except Exception: return set()
+
+def process_wrapper(args_tuple):
+    """Worker wrapper for process_point."""
+    try:
+        return process_point(args_tuple[1], args_tuple[2], args_tuple[0], verbose=False)
+    except Exception as e:
+        return {
+            "address": args_tuple[0], 
+            "lat": args_tuple[1], 
+            "lon": args_tuple[2], 
+            "status": "Error",
+            "extraction_error": str(e)
+        }
+
 def read_input_csv(csv_file):
+    """Read coordinates from input CSV with encoding detection."""
     try:
         encodings = ['utf-8', 'latin-1', 'iso-8859-1', 'cp1252', 'utf-16']
         df = None
         for encoding in encodings:
             try:
                 df = pd.read_csv(csv_file, encoding=encoding)
-                logging.info(f"Successfully read CSV with encoding: {encoding}")
                 break
-            except (UnicodeDecodeError, UnicodeError): continue
+            except Exception: continue
         if df is None: raise ValueError("Could not read CSV with any standard encoding")
-        address_col = lat_col = lon_col = None
-        for col in df.columns:
-            col_lower = col.lower().strip()
-            if col_lower in ['address', 'location', 'name', 'place']: address_col = col
-            elif col_lower in ['lat', 'latitude']: lat_col = col
-            elif col_lower in ['lon', 'long', 'longitude']: lon_col = col
-        if lat_col is None or lon_col is None:
-            raise ValueError(f"CSV must contain latitude and longitude columns. Found: {list(df.columns)}")
-        coords = []
-        for idx, row in df.iterrows():
-            try:
-                lat, lon = float(row[lat_col]), float(row[lon_col])
-                address = str(row[address_col]) if address_col and pd.notna(row[address_col]) else f"Location_{idx}"
-                coords.append((address, lat, lon))
-            except Exception as e:
-                logging.warning(f"Row {idx}: Invalid coordinates - {e}")
-                continue
-        return coords
-    except Exception as e:
-        logging.error(f"Error reading CSV: {e}"); sys.exit(1)
-# ---
-def preprocess_road_data(df):
-    print("\n" + "=" * 60 + "\nPREPROCESSING PIPELINE\n" + "=" * 60)
-    initial_rows = len(df)
-    df = df.dropna(how='all')
-    if 'lat' in df.columns and 'lon' in df.columns: df = df.dropna(subset=['lat', 'lon'])
-    df = df.reset_index(drop=True)
-    if (removed := initial_rows - len(df)) > 0:
-        print(f"  Cleaned: removed {removed} empty/invalid rows, {len(df)} remaining")
-    radii = [col.split('_')[-1] for col in df.columns if col.startswith('total_road_km_')]
-    if not radii:
-        print("  WARNING: No radius columns found — skipping preprocessing.")
-        return df
-    print(f"  Detected radii: {radii}")
-    print("\n[PHASE 1] Handling missing values...")
-    for r in radii:
-        cols = [f'total_road_km_{r}', f'Density_{r}', f'IntersectionDensity_{r}', f'AvgNodeDegree_{r}',
-                f'lane_km_per_km2_{r}', f'road_area_per_km2_{r}', f'DeadEndRatio_{r}', f'avg_segment_length_{r}']
-        missing = [c for c in cols if c not in df.columns]
-        if missing: continue
-        df[f'total_road_km_{r}'] = df[f'total_road_km_{r}'].fillna(0.0).clip(lower=0)
-        df[f'is_void_{r}'] = (df[f'total_road_km_{r}'] == 0)
-        for col in [f'Density_{r}', f'IntersectionDensity_{r}', f'lane_km_per_km2_{r}', f'road_area_per_km2_{r}']:
-            df.loc[df[f'is_void_{r}'], col] = 0.0
-            df[col] = df[col].fillna(0.0).clip(lower=0)
-        for col, default in [(f'AvgNodeDegree_{r}', 0.0), (f'DeadEndRatio_{r}', 0.0), (f'avg_segment_length_{r}', 100.0)]:
-            df.loc[df[f'is_void_{r}'], col] = 0.0
-            med = df.loc[~df[f'is_void_{r}'], col].median()
-            df[col] = df[col].fillna(med if not pd.isna(med) else default)
-        print(f"  ✓ Radius {r}: {int(df[f'is_void_{r}'].sum())} void areas detected")
-    print("\n[PHASE 2] Applying void masks...")
-    for r in radii:
-        if f'is_void_{r}' not in df.columns: continue
-        mask_cols = [f'total_road_km_{r}', f'Density_{r}', f'IntersectionDensity_{r}', f'AvgNodeDegree_{r}',
-                     f'lane_km_per_km2_{r}', f'road_area_per_km2_{r}', f'DeadEndRatio_{r}', f'avg_segment_length_{r}']
-        for col in mask_cols:
-            if col in df.columns: df.loc[df[f'is_void_{r}'], col] = 0.0
-    print("\n[PHASE 3] Engineering advanced features...")
-    for r in radii:
-        if not all(c in df.columns for c in [f'Density_{r}', f'IntersectionDensity_{r}', f'AvgNodeDegree_{r}', f'DeadEndRatio_{r}']): continue
-        df[f'Grid_Complexity_{r}'] = df[f'IntersectionDensity_{r}'] / (1 + df[f'DeadEndRatio_{r}'])
-        df[f'Major_Road_Connectivity_{r}'] = sum(df[c] for c in [f'share_motorway_{r}', f'share_trunk_{r}', f'share_primary_{r}', f'share_secondary_{r}'] if c in df.columns)
-        df[f'Local_Access_Intensity_{r}'] = sum(df[c] for c in [f'share_residential_{r}', f'share_living_street_{r}'] if c in df.columns)
-        df[f'Informal_Proxy_{r}'] = sum(df[c] for c in [f'share_unclassified_{r}', f'share_service_{r}'] if c in df.columns)
-        df[f'Network_Capacity_{r}'] = df[f'Density_{r}'] * df[f'AvgNodeDegree_{r}']
-        df[f'Congestion_Risk_{r}'] = (df[f'Density_{r}'] * df[f'DeadEndRatio_{r}'] * df[f'Informal_Proxy_{r}'])
-        for col in [f'Grid_Complexity_{r}', f'Major_Road_Connectivity_{r}', f'Local_Access_Intensity_{r}', f'Informal_Proxy_{r}', f'Network_Capacity_{r}', f'Congestion_Risk_{r}']:
-            if col in df.columns: df[col] = df[col].replace([np.inf, -np.inf], 0).fillna(0)
-        # 7. POI Infrastructure Score (bus stops + traffic signals)
-        poi_bus, poi_signals = f'poi_bus_stop_{r}', f'poi_traffic_signals_{r}'
-        bus_series = df[poi_bus] if poi_bus in df.columns else pd.Series(0, index=df.index)
-        sig_series = df[poi_signals] if poi_signals in df.columns else pd.Series(0, index=df.index)
         
-        area_km2_pi = np.pi * (int(r)/1000.0)**2
-        df[f'POI_Infrastructure_{r}'] = ((bus_series * 0.6 + sig_series * 0.4) / area_km2_pi).replace([np.inf, -np.inf], 0).fillna(0)
-        for col in [f'AvgBetweenness_{r}', f'MaxBetweenness_{r}', f'AvgCloseness_{r}']:
-            if col in df.columns: df[col] = df[col].replace([np.inf, -np.inf], 0).fillna(0)
-    print("\n" + "=" * 60 + "\nPREPROCESSING COMPLETE\n" + "=" * 60)
-    return df
-def process_wrapper(args_tuple):
-    try:
-        return process_point(args_tuple[1], args_tuple[2], args_tuple[0], verbose=False)
+        # Detect columns
+        lat_col = lon_col = addr_col = None
+        for c in df.columns:
+            cl = c.lower().strip()
+            if cl in ['lat', 'latitude']: lat_col = c
+            elif cl in ['lon', 'long', 'longitude']: lon_col = c
+            elif cl in ['address', 'name', 'place', 'location']: addr_col = c
+            
+        if not lat_col or not lon_col:
+            raise ValueError("CSV must have 'lat' and 'lon' columns.")
+            
+        points = []
+        for i, row in df.iterrows():
+            addr = str(row[addr_col]) if addr_col and pd.notna(row[addr_col]) else f"Point_{i}"
+            points.append((addr, float(row[lat_col]), float(row[lon_col])))
+        return points
     except Exception as e:
-        return {"address": args_tuple[0], "lat": args_tuple[1], "lon": args_tuple[2], "error": str(e)}
+        logging.error(f"Failed to read input CSV: {e}")
+        sys.exit(1)
+
+def preprocess_road_data(df):
+    """Clean, fill, and engineer features from extracted road data."""
+    radii = [500, 1000, 2000]
+    for r in radii:
+        # Fill raw extracted columns
+        df[f'total_road_km_{r}']       = df.get(f'total_road_km_{r}', 0).fillna(0.0)
+        df[f'Density_{r}']             = df.get(f'Density_{r}', 0).fillna(0.0)
+        df[f'IntersectionDensity_{r}'] = df.get(f'IntersectionDensity_{r}', 0).fillna(0.0)
+        df[f'AvgNodeDegree_{r}']       = df.get(f'AvgNodeDegree_{r}', 0).fillna(0.0)
+        df[f'DeadEndRatio_{r}']        = df.get(f'DeadEndRatio_{r}', 0).fillna(0.0)
+        df[f'lane_km_per_km2_{r}']     = df.get(f'lane_km_per_km2_{r}', 0).fillna(0.0)
+        df[f'road_area_per_km2_{r}']   = df.get(f'road_area_per_km2_{r}', 0).fillna(0.0)
+
+        for road_type in ['motorway', 'trunk', 'primary', 'secondary', 'tertiary',
+                          'residential', 'living_street', 'service', 'unclassified']:
+            df[f'share_{road_type}_{r}'] = df.get(f'share_{road_type}_{r}', 0).fillna(0.0)
+
+        # ── Derived features ──────────────────────────────────────────────────
+
+        # Grid Complexity: well-connected intersections penalised by dead-ends
+        df[f'Grid_Complexity_{r}'] = (
+            df[f'IntersectionDensity_{r}'] / (1 + df[f'DeadEndRatio_{r}'])
+        ).fillna(0.0)
+
+        # Informal Proxy: unclassified + service roads dominate informal layouts
+        df[f'Informal_Proxy_{r}'] = (
+            df[f'share_unclassified_{r}'] + df[f'share_service_{r}']
+        ).clip(0, 1).fillna(0.0)
+
+        # Network Capacity: throughput proxy = density × connectivity
+        df[f'Network_Capacity_{r}'] = (
+            df[f'Density_{r}'] * df[f'AvgNodeDegree_{r}']
+        ).fillna(0.0)
+
+        # Major Road Connectivity: share of backbone roads (motorway→secondary)
+        df[f'Major_Road_Connectivity_{r}'] = (
+            df[f'share_motorway_{r}'] + df[f'share_trunk_{r}'] +
+            df[f'share_primary_{r}']  + df[f'share_secondary_{r}']
+        ).clip(0, 1).fillna(0.0)
+
+        # Congestion Risk: high density with poor connectivity = congestion
+        # Uses safe division — 0 density → 0 risk
+        df[f'Congestion_Risk_{r}'] = (
+            df[f'Density_{r}'] / (df[f'AvgNodeDegree_{r}'].replace(0, np.nan))
+        ).fillna(0.0)
+
+    return df
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Road Feature Extraction + Preprocessing")
-    parser.add_argument("--input",  "-i", type=str, default="data/input/locations.csv")
-    parser.add_argument("--output", "-o", type=str, default="data/output/raw_features.csv")
-    parser.add_argument("--preprocessed-output", "-pp", type=str, default="data/output/preprocessed_features.csv")
-    parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--force-fresh", action="store_true")
+    parser = argparse.ArgumentParser(description="Road Feature Extraction")
+    parser.add_argument("--input",  "-i", required=True)
+    parser.add_argument("--output", "-o", required=True)
+    parser.add_argument("--preprocessed-output", "-pp", required=True)
     parser.add_argument("--parallel", "-p", action="store_true")
     parser.add_argument("--workers", "-w", type=int, default=None)
     parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--verbose", "-v", action="store_true")
-    parser.add_argument("--skip-preprocessing", action="store_true")
+    parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
     
-    OUTPUT_CSV = args.output
-    PREPROCESSED_CSV = args.preprocessed_output if args.preprocessed_output else str(Path(OUTPUT_CSV).parent / (Path(OUTPUT_CSV).stem + "_preprocessed" + Path(OUTPUT_CSV).suffix))
+    OUTPUT_CSV = Path(args.output)
+    PP_CSV = Path(args.preprocessed_output)
+    OUTPUT_CSV.parent.mkdir(parents=True, exist_ok=True)
     
-    logging.info(f"  Water raster: {WATER_RASTER} {'✓' if WATER_RASTER.exists() else 'NOT FOUND'}")
+    logging.info(f"Water raster: {WATER_RASTER} {'OK' if WATER_RASTER.exists() else 'NOT FOUND'}")
     inputs = read_input_csv(args.input)[:args.limit] if args.limit else read_input_csv(args.input)
-    if not inputs: 
-        logging.error("No valid coordinates found.")
-        sys.exit(1)
-        
-    all_results, start_index = [], 0
-    if os.path.exists(CHECKPOINT_FILE):
-        should_resume = args.resume if args.resume or args.force_fresh else False
-        if not (args.resume or args.force_fresh):
-            try: should_resume = (input("\n🔄 Checkpoint found. Resume? (y/n): ").strip().lower() == 'y')
-            except EOFError: should_resume = False
-        if should_resume: 
-            all_results, last_index = load_checkpoint()
-            start_index = last_index + 1
-        elif os.path.exists(CHECKPOINT_FILE): 
-            os.remove(CHECKPOINT_FILE)
-            
-    logging.info("\n" + "="*60 + "\nRAW FEATURE EXTRACTION\n" + "="*60)
-    num_workers = (args.workers if args.workers else max(1, cpu_count() - 1)) if args.parallel else 1
     
-    if start_index == 0 and inputs:
-        all_results.append(process_point(inputs[0][1], inputs[0][2], inputs[0][0], verbose=True))
-        start_index = 1
-        
-    remaining = inputs[start_index:]
+    # RESUME LOGIC: Check CSV instead of .pkl
+    processed = _load_processed_set(OUTPUT_CSV) if args.resume else set()
+    remaining = [pt for pt in inputs if (round(pt[1], 6), round(pt[2], 6)) not in processed]
     
-    if num_workers > 1 and remaining:
-        with Pool(processes=num_workers) as pool:
-            for i, result in enumerate(tqdm(pool.imap(process_wrapper, remaining), total=len(remaining), desc="Processing")):
+    if not remaining:
+        logging.info("All locations already processed. Nothing to do.")
+        # If we need to regenerate the preprocessed file, we'd load the full CSV here
+        sys.exit(0)
+
+    num_workers = args.workers if args.workers else (min(8, max(1, cpu_count() - 1)) if args.parallel else 1)
+    logging.info(f"Processing {len(remaining)}/{len(inputs)} locations | workers={num_workers} | resume={args.resume}")
+
+    all_results = []
+    # On resume, load previous successful results for final preprocessing
+    if args.resume and OUTPUT_CSV.exists() and OUTPUT_CSV.stat().st_size > 5:
+        try:
+            all_results = pd.read_csv(OUTPUT_CSV).to_dict('records')
+        except Exception:
+            all_results = []
+
+    _csv_header_written = [OUTPUT_CSV.exists() and OUTPUT_CSV.stat().st_size > 5]
+
+    def _append_result(result: dict):
+        """Append a result dict to the CSV, writing the header on the first call."""
+        row_df = pd.DataFrame([result])
+        if not _csv_header_written[0]:
+            row_df.to_csv(OUTPUT_CSV, mode='w', header=True, index=False)
+            _csv_header_written[0] = True
+        else:
+            row_df.to_csv(OUTPUT_CSV, mode='a', header=False, index=False)
+
+    try:
+        if num_workers > 1:
+            with Pool(processes=num_workers) as pool:
+                for result in tqdm(pool.imap(process_wrapper, remaining),
+                                   total=len(remaining), desc="Roads"):
+                    all_results.append(result)
+                    _append_result(result)
+        else:
+            for addr, lat, lon in tqdm(remaining, desc="Roads"):
+                result = process_point(lat, lon, addr)
                 all_results.append(result)
-                if ((start_index+i+1) % CHECKPOINT_INTERVAL == 0) or ((start_index+i+1) == len(inputs)):
-                    pd.DataFrame(all_results).to_csv(OUTPUT_CSV, index=False)
-                    save_checkpoint(all_results, start_index+i)
-    elif remaining:
-        for i, (addr, lat, lon) in enumerate(tqdm(remaining, desc="Processing")):
-            all_results.append(process_point(lat, lon, addr, verbose=False))
-            if ((start_index+i+1) % CHECKPOINT_INTERVAL == 0) or ((start_index+i+1) == len(inputs)):
-                pd.DataFrame(all_results).to_csv(OUTPUT_CSV, index=False)
-                save_checkpoint(all_results, start_index+i)
+                _append_result(result)
+    except KeyboardInterrupt:
+        logging.info("\nInterrupted. Progress saved to CSV.")
+        sys.exit(0)
                 
+    # Phase 2: Preprocessing
     df_raw = pd.DataFrame(all_results)
-    df_raw.to_csv(OUTPUT_CSV, index=False)
-        
-    if not args.skip_preprocessing:
-        df_pp = preprocess_road_data(df_raw.copy())
-        df_pp.to_csv(PREPROCESSED_CSV, index=False)
-        logging.info(f"✅ Saved → {PREPROCESSED_CSV}")
-        
-    logging.info(f"✅ Saved → {OUTPUT_CSV}\n⏱️ Time/point: ~10-30s")
-    logging.info(f"⏱️  Est. total for {len(inputs)} points: ~{len(inputs) * 20 / (3600 * num_workers):.1f} hours")
+    logging.info("Running preprocessing on all features...")
+    df_pp = preprocess_road_data(df_raw.copy())
+    df_pp.to_csv(PP_CSV, index=False)
+    
+    logging.info(f"Done! Raw features: {OUTPUT_CSV}")
+    logging.info(f"Done! Preprocessed features: {PP_CSV}")
